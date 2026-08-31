@@ -34,7 +34,7 @@ The `web_search` and `web_extract` tools support eight backend providers, config
 | **SearXNG** | `SEARXNG_URL` | ✔ | — | — |
 | **Brave** (free tier) | `BRAVE_SEARCH_API_KEY` | ✔ | — | — |
 | **DuckDuckGo** (ddgs) | _(none)_ | ✔ | — | — |
-| **Tavily** | `TAVILY_API_KEY` (optional) | ✔ | ✔ | — |
+| **Lightpanda** | `LIGHTPANDA_TOKEN` (optional — local binary works keyless) | ✔ | ✔ | — |
 | **Exa** | `EXA_API_KEY` | ✔ | ✔ | — |
 | **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ | — |
 | **xAI** | `XAI_API_KEY` | ✔ | — | — |
@@ -43,10 +43,10 @@ Quick setup example:
 
 ```yaml
 web:
-  backend: firecrawl    # firecrawl | searxng | brave-free | ddgs | tavily | exa | parallel | xai
+  backend: firecrawl    # firecrawl | searxng | brave-free | ddgs | lightpanda | exa | parallel | xai
 ```
 
-If `web.backend` is not set, the backend is auto-detected from whichever API key is available. Self-hosted Firecrawl is also supported via `FIRECRAWL_API_URL`. Selecting Tavily in `hermes tools` works without a key.
+If `web.backend` is not set, the backend is auto-detected from whichever API key is available. Self-hosted Firecrawl is also supported via `FIRECRAWL_API_URL`. Lightpanda works without a token when its local binary is installed.
 
 ## Browser Automation
 

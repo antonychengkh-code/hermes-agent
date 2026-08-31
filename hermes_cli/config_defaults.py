@@ -521,7 +521,8 @@ DEFAULT_CONFIG = {
         "extract_char_limit": 15000,  # per-page char budget for web_extract; larger pages truncate + store full text in cache/web
         # Keyless free-tier ring: with NO web backend configured or keyed,
         # web_search/web_extract rotate round-robin across five vendors'
-        # public free tiers (exa, parallel, tavily, firecrawl, keenable),
+        # public free tiers (exa, parallel, firecrawl, keenable, and —
+        # when its local binary is installed — lightpanda),
         # failing over to the next ring vendor on rate limits. Never
         # pre-empts a configured or keyed backend. Set false to disable.
         "keyless_fallback": True,
@@ -531,8 +532,8 @@ DEFAULT_CONFIG = {
         # (no sticky failover). Off when keyless_fallback is false.
         "keyless_rescue": True,
         # Per-provider tier selection for ring vendors with both a keyless
-        # free endpoint and a keyed paid path (exa, parallel, tavily,
-        # firecrawl, keenable). Set by the `hermes tools` picker's
+        # free endpoint and a keyed paid path (exa, parallel,
+        # firecrawl, keenable, lightpanda). Set by the `hermes tools` picker's
         # "Free (keyless)" / "Paid (API key)" rows.
         #   free  — always use the anonymous free endpoint (even with a key)
         #   paid  — always use the keyed path (missing key = error; vendor
@@ -4438,10 +4439,10 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
         "advanced": True,
     },
-    "TAVILY_API_KEY": {
-        "description": "Tavily API key for AI-native web search and extract (optional — keyless works without it)",
-        "prompt": "Tavily API key",
-        "url": "https://app.tavily.com/home",
+    "LIGHTPANDA_TOKEN": {
+        "description": "Lightpanda Cloud API token for hosted JS-rendered web extraction (optional — the local lightpanda binary works without it)",
+        "prompt": "Lightpanda Cloud API token",
+        "url": "https://console.lightpanda.io/signup",
         "tools": ["web_search", "web_extract"],
         "password": True,
         "category": "tool",

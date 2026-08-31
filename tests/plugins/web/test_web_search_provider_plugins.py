@@ -2,8 +2,8 @@
 
 Covers:
 
-- All eight bundled plugins (brave-free, ddgs, searxng, exa, parallel,
-  tavily, firecrawl, xai) instantiate and self-report the expected
+- All bundled plugins (brave-free, ddgs, searxng, exa, parallel,
+  firecrawl, keenable, lightpanda, xai) instantiate and self-report the expected
   capabilities + ABC-derived defaults.
 - Each plugin's ``is_available()`` correctly reflects env-var presence.
 - The web_search_registry resolves an active provider in the documented
@@ -34,8 +34,8 @@ def _clear_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for k in (
         "BRAVE_SEARCH_API_KEY",
         "SEARXNG_URL",
-        "TAVILY_API_KEY",
-        "TAVILY_BASE_URL",
+        "KEENABLE_API_KEY",
+        "LIGHTPANDA_TOKEN",
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
         "PARALLEL_SEARCH_MODE",
@@ -68,7 +68,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestBundledPluginsRegister:
-    """All eight bundled web plugins discover and register correctly."""
+    """All bundled web plugins discover and register correctly."""
 
     def test_all_bundled_plugins_present_in_registry(self) -> None:
         _ensure_plugins_loaded()
@@ -81,9 +81,9 @@ class TestBundledPluginsRegister:
             "exa",
             "firecrawl",
             "keenable",
+            "lightpanda",
             "parallel",
             "searxng",
-            "tavily",
             "xai",
         ]
 
@@ -95,7 +95,8 @@ class TestBundledPluginsRegister:
             ("searxng", True, False),
             ("exa", True, True),
             ("parallel", True, True),
-            ("tavily", True, True),
+            ("keenable", True, True),
+            ("lightpanda", True, True),
             ("firecrawl", True, True),
             # xai: search-only via Grok's agentic web_search tool.
             ("xai", True, False),
@@ -117,7 +118,7 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
+        ["brave-free", "ddgs", "searxng", "exa", "parallel", "firecrawl", "keenable", "lightpanda", "xai"],
     )
     def test_each_plugin_has_name_and_display_name(self, plugin_name: str) -> None:
         _ensure_plugins_loaded()
@@ -157,14 +158,19 @@ class TestIsAvailable:
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
         assert p.is_available() is True
 
-    def test_tavily_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_lightpanda_requires_token_or_binary(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _ensure_plugins_loaded()
         from agent.web_search_registry import get_provider
+        import plugins.web.lightpanda.provider as lp
 
-        p = get_provider("tavily")
+        p = get_provider("lightpanda")
         assert p is not None
+        monkeypatch.setattr(lp, "find_lightpanda_binary", lambda: None)
         assert p.is_available() is False
-        monkeypatch.setenv("TAVILY_API_KEY", "real")
+        monkeypatch.setenv("LIGHTPANDA_TOKEN", "real")
+        assert p.is_available() is True
+        monkeypatch.delenv("LIGHTPANDA_TOKEN", raising=False)
+        monkeypatch.setattr(lp, "find_lightpanda_binary", lambda: "/usr/bin/lightpanda")
         assert p.is_available() is True
 
     def test_exa_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:

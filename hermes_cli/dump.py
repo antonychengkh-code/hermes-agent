@@ -387,7 +387,7 @@ def run_dump(args):
         ("COMMANDCODE_API_KEY", "commandcode"),
         ("KILOCODE_API_KEY", "kilocode"),
         ("FIRECRAWL_API_KEY", "firecrawl"),
-        ("TAVILY_API_KEY", "tavily"),
+        ("LIGHTPANDA_TOKEN", "lightpanda"),
         ("BROWSERBASE_API_KEY", "browserbase"),
         ("FAL_KEY", "fal"),
         ("ELEVENLABS_API_KEY", "elevenlabs"),

@@ -82,8 +82,9 @@ def register_all_web_providers():
     from plugins.web.exa.provider import ExaWebSearchProvider
     from plugins.web.firecrawl.provider import FirecrawlWebSearchProvider
     from plugins.web.parallel.provider import ParallelWebSearchProvider
+    from plugins.web.keenable.provider import KeenableWebSearchProvider
+    from plugins.web.lightpanda.provider import LightpandaWebSearchProvider
     from plugins.web.searxng.provider import SearXNGWebSearchProvider
-    from plugins.web.tavily.provider import TavilyWebSearchProvider
     from plugins.web.xai.provider import XAIWebSearchProvider
 
     _reset_for_tests()
@@ -93,8 +94,9 @@ def register_all_web_providers():
         ExaWebSearchProvider,
         FirecrawlWebSearchProvider,
         ParallelWebSearchProvider,
+        KeenableWebSearchProvider,
+        LightpandaWebSearchProvider,
         SearXNGWebSearchProvider,
-        TavilyWebSearchProvider,
         XAIWebSearchProvider,
     ):
         register_provider(cls())

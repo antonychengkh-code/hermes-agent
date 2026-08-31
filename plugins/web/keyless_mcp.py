@@ -439,115 +439,6 @@ def exa_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Tavily keyless (api.tavily.com — X-Tavily-Access-Mode: keyless)
-# ---------------------------------------------------------------------------
-
-
-TAVILY_API_URL = "https://api.tavily.com"
-
-
-def _tavily_keyless_post(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """POST to Tavily with keyless headers; raise KeylessMCPError on failure."""
-    import requests
-
-    try:
-        response = requests.post(
-            f"{TAVILY_API_URL}/{endpoint.lstrip('/')}",
-            json=payload,
-            headers={
-                "Content-Type": "application/json",
-                "X-Client-Name": "hermes-agent",
-                "X-Tavily-Access-Mode": "keyless",
-            },
-            timeout=_TIMEOUT_SECONDS,
-        )
-    except requests.RequestException as exc:
-        raise KeylessMCPError(f"request failed: {exc}") from exc
-    if response.status_code >= 400:
-        raise KeylessMCPError(
-            (response.text or "").strip() or f"HTTP {response.status_code}"
-        )
-    return response.json()
-
-
-def tavily_search_keyless(query: str, limit: int = 5) -> Dict[str, Any]:
-    """Keyless Tavily search → legacy search response shape."""
-    try:
-        data = _tavily_keyless_post(
-            "search", {"query": query, "max_results": max(1, int(limit))}
-        )
-    except KeylessMCPError as exc:
-        return {
-            "success": False,
-            "error": (
-                f"Keyless Tavily search failed: {exc}. "
-                "Set TAVILY_API_KEY (https://app.tavily.com) or another web "
-                "backend via `hermes tools` for reliable service."
-            ),
-        }
-    web_results = []
-    for i, result in enumerate(data.get("results") or []):
-        web_results.append(
-            {
-                "url": result.get("url") or "",
-                "title": result.get("title") or "",
-                "description": result.get("content") or "",
-                "position": i + 1,
-            }
-        )
-    return {"success": True, "data": {"web": web_results}}
-
-
-def tavily_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
-    """Keyless Tavily extract → legacy extract result list."""
-    try:
-        data = _tavily_keyless_post("extract", {"urls": list(urls)})
-    except KeylessMCPError as exc:
-        message = (
-            f"Keyless Tavily extract failed: {exc}. "
-            "Set TAVILY_API_KEY (https://app.tavily.com) or another web "
-            "backend via `hermes tools` for reliable service."
-        )
-        return [
-            {"url": u, "title": "", "content": "", "error": message}
-            for u in urls
-        ]
-    results: List[Dict[str, Any]] = []
-    seen = set()
-    for result in data.get("results") or []:
-        url = result.get("url") or ""
-        raw = result.get("raw_content") or result.get("content") or ""
-        seen.add(url)
-        results.append(
-            {
-                "url": url,
-                "title": result.get("title") or "",
-                "content": raw,
-                "raw_content": raw,
-                "metadata": {"sourceURL": url, "title": result.get("title") or ""},
-            }
-        )
-    for fail in data.get("failed_results") or []:
-        url = (fail.get("url") if isinstance(fail, dict) else str(fail)) or ""
-        seen.add(url)
-        results.append(
-            {
-                "url": url,
-                "title": "",
-                "content": "",
-                "error": (fail.get("error") if isinstance(fail, dict) else None)
-                or "extraction failed",
-            }
-        )
-    for u in urls:
-        if u not in seen:
-            results.append(
-                {"url": u, "title": "", "content": "", "error": "no content returned"}
-            )
-    return results
-
-
-# ---------------------------------------------------------------------------
 # Firecrawl keyless (public cloud API, no auth header)
 # ---------------------------------------------------------------------------
 
@@ -728,25 +619,96 @@ def keenable_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Lightpanda keyless (local binary — on-device browser + Keenable search)
+# ---------------------------------------------------------------------------
+
+
+def lightpanda_search_keyless(query: str, limit: int = 5) -> Dict[str, Any]:
+    """Keyless Lightpanda search → legacy search response shape.
+
+    Runs the local ``lightpanda`` binary's MCP ``search`` tool, which
+    routes through Keenable's keyless public endpoint. Requires the binary
+    (the ring order filter excludes lightpanda when it isn't installed).
+    """
+    from plugins.web.lightpanda.provider import local_search
+
+    try:
+        return {"success": True, "data": {"web": local_search(query, limit)}}
+    except Exception as exc:  # noqa: BLE001 — normalized below
+        return {
+            "success": False,
+            "error": (
+                f"Keyless Lightpanda search failed: {exc}. "
+                "Install the lightpanda binary (https://lightpanda.io) or "
+                "pick another web backend via `hermes tools`."
+            ),
+        }
+
+
+def lightpanda_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
+    """Keyless Lightpanda extract → legacy extract result list.
+
+    Renders each URL with the local binary (real JS execution, no network
+    service) and dumps markdown. Called per-URL; failures become per-URL
+    error entries.
+    """
+    from plugins.web.lightpanda.provider import local_fetch_markdown
+
+    results: List[Dict[str, Any]] = []
+    for url in urls:
+        try:
+            content = local_fetch_markdown(url)
+            title = ""
+            for line in content.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("# "):
+                    title = stripped[2:].strip()
+                    break
+            results.append(
+                {
+                    "url": url,
+                    "title": title,
+                    "content": content,
+                    "raw_content": content,
+                    "metadata": {"sourceURL": url, "title": title},
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 — per-URL error entry
+            results.append(
+                {
+                    "url": url,
+                    "title": "",
+                    "content": "",
+                    "error": (
+                        f"Keyless Lightpanda extract failed: {exc}. "
+                        "Install the lightpanda binary (https://lightpanda.io) "
+                        "for reliable local extraction."
+                    ),
+                }
+            )
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Round-robin ring + next-in-line failover (rate-limited free tiers)
 # ---------------------------------------------------------------------------
 
-_KEYLESS_RING = ("exa", "parallel", "tavily", "firecrawl", "keenable")
+_KEYLESS_RING = ("exa", "parallel", "firecrawl", "keenable", "lightpanda")
 
 _KEYLESS_SEARCHERS = {
     "exa": lambda query, limit: exa_search_keyless(query, limit),
     "parallel": lambda query, limit: parallel_search_keyless(query, limit),
-    "tavily": lambda query, limit: tavily_search_keyless(query, limit),
     "firecrawl": lambda query, limit: firecrawl_search_keyless(query, limit),
     "keenable": lambda query, limit: keenable_search_keyless(query, limit),
+    "lightpanda": lambda query, limit: lightpanda_search_keyless(query, limit),
 }
 
 _KEYLESS_EXTRACTORS = {
     "exa": lambda urls: exa_extract_keyless(urls),
     "parallel": lambda urls: parallel_extract_keyless(urls),
-    "tavily": lambda urls: tavily_extract_keyless(urls),
     "firecrawl": lambda urls: firecrawl_extract_keyless(urls),
     "keenable": lambda urls: keenable_extract_keyless(urls),
+    "lightpanda": lambda urls: lightpanda_extract_keyless(urls),
 }
 
 # Per-process round-robin cursor, seeded by the random session id so the
@@ -799,7 +761,26 @@ def _ring_order(name: str) -> List[str]:
         _KEYLESS_RING[(start + i) % len(_KEYLESS_RING)]
         for i in range(len(_KEYLESS_RING))
     ]
-    return [v for v in ordered if provider_tier(v) != "paid"]
+    return [v for v in ordered if provider_tier(v) != "paid" and _vendor_usable(v)]
+
+
+def _vendor_usable(name: str) -> bool:
+    """Structural usability gate for ring vendors with local prerequisites.
+
+    Lightpanda's free tier runs the locally installed ``lightpanda``
+    binary — on machines without it the vendor is skipped entirely so the
+    ring never burns a failover hop on a guaranteed miss. Pure-HTTP
+    vendors are always usable.
+    """
+    if name != "lightpanda":
+        return True
+    try:
+        from plugins.web.lightpanda.provider import find_lightpanda_binary
+
+        return bool(find_lightpanda_binary())
+    except Exception as exc:  # noqa: BLE001 — provider optional in stripped envs
+        logger.debug("lightpanda usability probe failed: %s", exc)
+        return False
 
 
 def search_with_failover(name: str, query: str, limit: int = 5) -> Dict[str, Any]:
