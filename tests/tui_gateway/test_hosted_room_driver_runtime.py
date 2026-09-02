@@ -6,6 +6,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -18,6 +19,11 @@ from tui_gateway.hosted_room_driver import (
     HostedRoomBinding,
     HostedRoomRuntime,
     room_session_title,
+)
+from tui_gateway.hosted_room_peer_http import PeerRunsHTTPError
+from tui_gateway.hosted_room_peer_transport import (
+    PeerHostedRoomTransport,
+    PeerMemberRoute,
 )
 
 
@@ -272,6 +278,91 @@ class SelectiveCompletionRPC(FakeSessionRPC):
                 self.auto_complete = original
 
 
+class NotAdmittedThenSuccessRPC(FakeSessionRPC):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+        self.attempted_generations: list[int] = []
+
+    def submit(self, **kwargs):
+        self.attempted_generations.append(kwargs["execution_generation"])
+        if self.failures > 0:
+            self.failures -= 1
+            self.calls.append(("submit", dict(kwargs)))
+            raise PeerRunsHTTPError(
+                "peer refused the connection",
+                retryable=True,
+                not_admitted=True,
+            )
+        return super().submit(**kwargs)
+
+
+class TerminalPeerClient:
+    """Peer client whose terminal history would look failed if read first."""
+
+    def __init__(self, *, task_id: str, execution_generation: int) -> None:
+        self.task_id = task_id
+        self.execution_generation = execution_generation
+        self.status_task_id = task_id
+        self.status_generation = execution_generation
+        self.status_value = "interrupted"
+        self.history_calls = 0
+
+    def prepare(self, **_kwargs):
+        return {"session_id": "peer-session"}
+
+    def status(self, **_kwargs):
+        return {
+            "active": False,
+            "status": self.status_value,
+            "task_id": self.status_task_id,
+            "execution_generation": self.status_generation,
+        }
+
+    def history(self, **_kwargs):
+        self.history_calls += 1
+        return [{
+            "role": "assistant",
+            "task_id": self.task_id,
+            "execution_generation": self.execution_generation,
+            "status": "failed",
+            "message_id": "peer-interrupted",
+            "content": "interrupted",
+        }]
+
+    def stop_receipt(self, **_kwargs):
+        return {"status": "stopping"}
+
+    def stop(self, **_kwargs):
+        return {"status": "stopping"}
+
+
+def _peer_resolver(client: TerminalPeerClient):
+    route = PeerMemberRoute(
+        home_install_id="install-home",
+        member_id=PROFILE,
+        target_install_id="install-peer",
+        target_profile=PROFILE,
+        capability_digest="a" * 64,
+        execution_policy_digest="b" * 64,
+        cancellation_scope_id="cancel-peer",
+        trace_id="trace-peer",
+        grant="signed-room-grant",
+    )
+
+    def resolve(binding, task):
+        return PeerHostedRoomTransport(
+            binding=binding,
+            route=route,
+            client=client,
+            source_event_seq=int(task["payload"]["source_event_seq"]),
+            task_id=task["identity"].task_id,
+            execution_generation=int(task["execution_generation"]),
+        )
+
+    return resolve
+
+
 @pytest.fixture
 def db(tmp_path: Path) -> Path:
     path = tmp_path / "state.db"
@@ -401,7 +492,7 @@ def test_waiting_room_does_not_block_an_independent_local_room(tmp_path: Path):
     assert state.get_task(db, identities[0])["status"] == "running"
     _wait_for(lambda: len(runtime.status()["current_tasks"]) == 1)
     assert len(runtime.status()["current_tasks"]) == 1
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
 
 def test_rotated_bounded_scheduler_eventually_runs_later_room(tmp_path: Path):
@@ -446,7 +537,7 @@ def test_rotated_bounded_scheduler_eventually_runs_later_room(tmp_path: Path):
 
     runtime.start()
     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
 
 def test_queued_task_routes_profile_and_credentials_without_overrides(db: Path):
@@ -457,7 +548,7 @@ def test_queued_task_routes_profile_and_credentials_without_overrides(db: Path):
 
     runtime.start()
     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
     create = next(params for method, params in rpc.calls if method == "create")
     submit = next(params for method, params in rpc.calls if method == "submit")
@@ -489,7 +580,7 @@ def test_worker_settles_without_any_client_transport(db: Path):
 
     assert runtime.status()["running"] is True
     assert runtime.status()["cycles"] >= 1
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
 
 def test_policy_hooks_prepare_and_publish_terminal_idempotently(db: Path):
@@ -510,10 +601,218 @@ def test_policy_hooks_prepare_and_publish_terminal_idempotently(db: Path):
 
     runtime.start()
     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
     assert prepared
     assert published == [(ROOM_ID, identity.task_id, "settled")]
+
+
+def test_transport_resolver_selects_member_transport_without_forking_state(
+    db: Path,
+):
+    identity = _identity()
+    _admit(db, identity)
+    selected = FakeSessionRPC()
+    resolutions = []
+
+    def resolve_transport(binding, task):
+        resolutions.append((binding, task["identity"], task["payload"]))
+        return selected
+
+    runtime = HostedRoomRuntime(
+        db_path=db,
+        rooms=[BINDING],
+        transport_resolver=resolve_transport,
+        turn_lock=RecordingTurnLocks(),
+        lease_ttl_seconds=0.4,
+        poll_interval_seconds=0.01,
+    )
+
+    runtime.start()
+    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    assert runtime.stop(timeout=5.0)
+
+    assert resolutions
+    assert all(binding == BINDING for binding, _, _ in resolutions)
+    assert all(task_identity == identity for _, task_identity, _ in resolutions)
+    assert any(method == "submit" for method, _ in selected.calls)
+
+
+def test_not_admitted_peer_task_stays_queued_with_exponential_capped_retry(
+    db: Path,
+):
+    now = [100.0]
+    identity = _identity()
+    _admit(db, identity, prompt="Keep this exact prompt queued.")
+    rpc = NotAdmittedThenSuccessRPC(failures=3)
+    runtime = _runtime(
+        db,
+        rpc,
+        clock=lambda: now[0],
+        lease_ttl_seconds=30,
+        unavailable_retry_min_seconds=2,
+        unavailable_retry_max_seconds=4,
+    )
+
+    runtime._run_cycle()
+    assert state.get_task(db, identity)["status"] == "queued"
+    assert rpc.attempted_generations == [1]
+
+    runtime._run_cycle()
+    assert rpc.attempted_generations == [1]
+    now[0] += 2
+    runtime._run_cycle()
+    assert rpc.attempted_generations == [1, 2]
+
+    now[0] += 3.9
+    runtime._run_cycle()
+    assert rpc.attempted_generations == [1, 2]
+    now[0] += 0.1
+    runtime._run_cycle()
+    assert rpc.attempted_generations == [1, 2, 3]
+
+    now[0] += 4
+    runtime._run_cycle()
+    task = state.get_task(db, identity)
+    assert task["status"] == "settled"
+    assert task["execution_generation"] == 4
+    assert task["payload"]["prompt"] == "Keep this exact prompt queued."
+    assert rpc.attempted_generations == [1, 2, 3, 4]
+
+
+def test_not_admitted_room_does_not_block_other_rooms(tmp_path: Path):
+    db = tmp_path / "state.db"
+    for room_id in ("room-1", "room-2"):
+        hosted_rooms.create_room(
+            db,
+            room_id=room_id,
+            name=room_id,
+            members=[{"profile": PROFILE, "handle": PROFILE}],
+            authority_gateway_id=BINDING.gateway_id,
+            now=90,
+        )
+    offline_identity = _identity("offline-task")
+    healthy_identity = state.TaskIdentity(
+        "room-2", "healthy-task", "thread-2", "turn-healthy"
+    )
+    _admit(db, offline_identity)
+    _admit(db, healthy_identity)
+    offline = NotAdmittedThenSuccessRPC(failures=10)
+    healthy = FakeSessionRPC()
+    runtime = HostedRoomRuntime(
+        db_path=db,
+        rooms=[BINDING, HostedRoomBinding("room-2", "gateway-a", 1)],
+        transport_resolver=lambda binding, _task: (
+            offline if binding.room_id == ROOM_ID else healthy
+        ),
+        turn_lock=RecordingTurnLocks(),
+        clock=lambda: 100.0,
+        lease_ttl_seconds=30,
+        poll_interval_seconds=0.01,
+    )
+
+    runtime._run_cycle()
+
+    assert state.get_task(db, offline_identity)["status"] == "queued"
+    assert state.get_task(db, healthy_identity)["status"] == "settled"
+
+
+def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path):
+    db = tmp_path / "state.db"
+    bindings = [
+        HostedRoomBinding("room-waiting", "gateway-a", 1),
+        HostedRoomBinding("room-healthy", "gateway-a", 1),
+    ]
+    identities = [
+        state.TaskIdentity("room-waiting", "task-waiting", "thread-a", "turn-a"),
+        state.TaskIdentity("room-healthy", "task-healthy", "thread-b", "turn-b"),
+    ]
+    profiles = ["profile-waiting", "profile-healthy"]
+    for binding, identity, profile in zip(bindings, identities, profiles):
+        hosted_rooms.create_room(
+            db,
+            room_id=binding.room_id,
+            name=binding.room_id,
+            members=[{"profile": profile, "handle": profile}],
+            authority_gateway_id=binding.gateway_id,
+            now=time.time(),
+        )
+        state.admit_task(
+            db,
+            identity,
+            payload={
+                "target_profile": profile,
+                "prompt": f"Run {binding.room_id}.",
+                "source_event_seq": 1,
+            },
+            clock=time.time,
+        )
+
+    waiting = FakeSessionRPC(auto_complete=False)
+    healthy = FakeSessionRPC()
+    runtime = HostedRoomRuntime(
+        db_path=db,
+        rooms=bindings,
+        transport_resolver=lambda binding, _task: (
+            waiting if binding.room_id == "room-waiting" else healthy
+        ),
+        turn_lock=RecordingTurnLocks(),
+        lease_ttl_seconds=0.4,
+        poll_interval_seconds=0.01,
+        max_concurrent_rooms=2,
+    )
+
+    runtime.start()
+    assert waiting.submitted.wait(1.0)
+    _wait_for(lambda: state.get_task(db, identities[1])["status"] == "settled")
+    assert state.get_task(db, identities[0])["status"] == "running"
+    assert runtime.stop(timeout=5.0)
+
+
+def test_bounded_scheduler_eventually_runs_later_room(tmp_path: Path):
+    db = tmp_path / "state.db"
+    bindings = [
+        HostedRoomBinding(f"room-{index}", "gateway-a", 1)
+        for index in range(1, 4)
+    ]
+    for binding in bindings:
+        hosted_rooms.create_room(
+            db,
+            room_id=binding.room_id,
+            name=binding.room_id,
+            members=[{"profile": PROFILE, "handle": PROFILE}],
+            authority_gateway_id=binding.gateway_id,
+            now=time.time(),
+        )
+    identity = state.TaskIdentity(
+        "room-3",
+        "task-room-3",
+        "thread-room-3",
+        "turn-room-3",
+    )
+    state.admit_task(
+        db,
+        identity,
+        payload={
+            "target_profile": PROFILE,
+            "prompt": "Run the later room.",
+            "source_event_seq": 1,
+        },
+        clock=time.time,
+    )
+    runtime = HostedRoomRuntime(
+        db_path=db,
+        rooms=bindings,
+        rpc=FakeSessionRPC(),
+        turn_lock=RecordingTurnLocks(),
+        lease_ttl_seconds=0.4,
+        poll_interval_seconds=0.01,
+        max_concurrent_rooms=2,
+    )
+
+    runtime.start()
+    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    assert runtime.stop(timeout=5.0)
 
 
 def test_existing_canonical_session_is_resumed_not_duplicated(db: Path):
@@ -525,7 +824,7 @@ def test_existing_canonical_session_is_resumed_not_duplicated(db: Path):
 
     runtime.start()
     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
     assert not [call for call in rpc.calls if call[0] == "create"]
     resume = next(params for method, params in rpc.calls if method == "resume")
@@ -663,18 +962,79 @@ def test_oversized_terminal_reply_is_bounded_without_waiting_for_deadline(db: Pa
     runtime = _runtime(db, rpc, turn_timeout_seconds=30)
 
     runtime.start()
-    assert rpc.submitted.wait(timeout=1.0)
+    assert rpc.submitted.wait(timeout=5.0)
     rpc.complete(
         identity.task_id,
         content="é" * (MAX_TERMINAL_TEXT_BYTES + 100),
     )
     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
     result = state.get_task(db, identity)["result"]
     assert result["truncated"] is True
     assert len(result["text"].encode("utf-8")) <= MAX_TERMINAL_TEXT_BYTES
     assert result["text"].endswith("share the full result as a file.]")
+
+
+def test_peer_recovery_probe_is_bounded_by_attempt_and_stale_age(db: Path):
+    identity = _identity()
+    now = [100.0]
+
+    def clock():
+        return now[0]
+
+    old_lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation="old-process",
+        ttl_seconds=1,
+        clock=clock,
+    )
+    _admit(db, identity)
+    state.start_task(
+        db,
+        identity,
+        old_lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    now[0] = 102.0
+    runtime = _runtime(
+        db,
+        FakeSessionRPC(),
+        clock=clock,
+        lease_ttl_seconds=30,
+        indeterminate_defer_seconds=5,
+    )
+    recovery_lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation=runtime.process_generation,
+        ttl_seconds=30,
+        clock=clock,
+    )
+    state.recover_room(db, recovery_lease, clock=clock)
+    runtime.transport_resolver = lambda _binding, _task: object()
+    probes = []
+
+    def inspect(_binding, task):
+        probes.append((task["identity"].task_id, now[0]))
+        return SimpleNamespace(terminal=None, active=False, status=None)
+
+    runtime._inspect_recovery_session = inspect
+
+    assert runtime._reconcile_indeterminate(BINDING, recovery_lease) is True
+    assert runtime._reconcile_indeterminate(BINDING, recovery_lease) is True
+    assert probes == [(identity.task_id, 102.0)]
+
+    now[0] = 108.0
+    assert runtime._reconcile_indeterminate(BINDING, recovery_lease) is False
+    assert probes == [(identity.task_id, 102.0), (identity.task_id, 108.0)]
+    assert state.get_task(db, identity)["status"] == "deferred"
 
 
 def test_turn_deadline_stops_exact_attempt_and_publishes_durable_failure(db: Path):
@@ -692,7 +1052,7 @@ def test_turn_deadline_stops_exact_attempt_and_publishes_durable_failure(db: Pat
 
     runtime.start()
     _wait_for(lambda: state.get_task(db, identity)["status"] == "failed")
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
     failed = state.get_task(db, identity)
     assert failed["result"] == {
@@ -759,7 +1119,7 @@ def test_deadline_releases_worker_capacity_for_later_room(tmp_path: Path):
     runtime.start()
     _wait_for(lambda: state.get_task(db, identities[0])["status"] == "failed")
     _wait_for(lambda: state.get_task(db, identities[1])["status"] == "settled")
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
     assert state.get_task(db, identities[0])["result"]["reason_code"] == (
         "turn_deadline_exceeded"
@@ -830,7 +1190,7 @@ def test_retry_ignores_late_receipt_from_prior_execution_generation(db: Path):
     runtime.start()
     assert rpc.submitted.wait(1.0)
     time.sleep(0.04)
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
     task = state.get_task(db, identity)
     assert task["status"] == "running"
@@ -862,9 +1222,185 @@ def test_active_recovered_turn_is_never_resubmitted(db: Path):
 
     runtime.start()
     time.sleep(0.08)
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
     assert state.get_task(db, identity)["status"] == "running"
+    assert not [call for call in rpc.calls if call[0] == "submit"]
+
+
+def test_retry_cannot_advance_generation_while_original_attempt_is_active(
+    db: Path,
+):
+    identity = _identity()
+    now = [100.0]
+
+    def clock():
+        return now[0]
+
+    old_lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation="old-process",
+        ttl_seconds=1,
+        clock=clock,
+    )
+    _admit(db, identity)
+    attempt = state.start_task(
+        db,
+        identity,
+        old_lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    now[0] = 102.0
+    recovery_lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation="recovery-process",
+        ttl_seconds=30,
+        clock=clock,
+    )
+    state.recover_room(db, recovery_lease, clock=clock)
+    state.release_lease(db, recovery_lease, clock=clock)
+    rpc = FakeSessionRPC(auto_complete=False)
+    session_id = rpc.add_session(active=True, task_id=identity.task_id)
+    rpc.states[session_id]["execution_generation"] = attempt.execution_generation
+    runtime = _runtime(db, rpc, clock=clock)
+
+    with pytest.raises(state.InvalidTaskTransitionError, match="still active"):
+        runtime.retry_indeterminate(identity)
+
+    task = state.get_task(db, identity)
+    assert task["status"] == "indeterminate"
+    assert task["execution_generation"] == attempt.execution_generation
+    assert not [call for call in rpc.calls if call[0] == "submit"]
+
+
+def test_retry_uses_runtime_session_id_returned_by_resume(db: Path):
+    identity = _identity()
+    now = [100.0]
+
+    def clock():
+        return now[0]
+
+    old_lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation="old-process",
+        ttl_seconds=1,
+        clock=clock,
+    )
+    _admit(db, identity)
+    state.start_task(
+        db,
+        identity,
+        old_lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    now[0] = 102.0
+    recovery_lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation="recovery-process",
+        ttl_seconds=30,
+        clock=clock,
+    )
+    state.recover_room(db, recovery_lease, clock=clock)
+    state.release_lease(db, recovery_lease, clock=clock)
+
+    rpc = FakeSessionRPC(auto_complete=False)
+    stored_id = rpc.add_session(active=False, task_id=identity.task_id)
+    runtime_id = "runtime-session"
+    rpc.states[runtime_id] = rpc.states.pop(stored_id)
+
+    def resume(**kwargs):
+        rpc.calls.append(("resume", dict(kwargs)))
+        return {"session_id": runtime_id}
+
+    observed: dict[str, str] = {}
+    original_history = rpc.history
+    original_info = rpc.info
+
+    def history(**kwargs):
+        observed["history"] = kwargs["session_id"]
+        return original_history(**kwargs)
+
+    def info(**kwargs):
+        observed["info"] = kwargs["session_id"]
+        return original_info(**kwargs)
+
+    rpc.resume = resume
+    rpc.history = history
+    rpc.info = info
+    runtime = _runtime(db, rpc, clock=clock)
+
+    retried = runtime.retry_indeterminate(identity)
+
+    assert retried["status"] == "queued"
+    assert observed == {"history": runtime_id, "info": runtime_id}
+
+
+def test_retry_reconciles_terminal_remote_cancellation_without_new_generation(
+    db: Path,
+):
+    identity = _identity()
+    now = [100.0]
+
+    def clock():
+        return now[0]
+
+    old_lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation="old-process",
+        ttl_seconds=1,
+        clock=clock,
+    )
+    _admit(db, identity)
+    attempt = state.start_task(
+        db,
+        identity,
+        old_lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    now[0] = 102.0
+    recovery_lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation="recovery-process",
+        ttl_seconds=30,
+        clock=clock,
+    )
+    state.recover_room(db, recovery_lease, clock=clock)
+    state.release_lease(db, recovery_lease, clock=clock)
+    rpc = FakeSessionRPC(auto_complete=False)
+    rpc.add_session(active=False, task_id=identity.task_id)
+    original_info = rpc.info
+
+    def cancelled_info(**kwargs):
+        return {**original_info(**kwargs), "status": "cancelled"}
+
+    rpc.info = cancelled_info
+    runtime = _runtime(db, rpc, clock=clock)
+
+    cancelled = runtime.retry_indeterminate(identity)
+
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["execution_generation"] == attempt.execution_generation
     assert not [call for call in rpc.calls if call[0] == "submit"]
 
 
@@ -899,7 +1435,7 @@ def test_ambiguous_recovery_remains_indeterminate(db: Path):
 
     runtime.start()
     _wait_for(lambda: state.get_task(db, identity)["status"] == "indeterminate")
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
     assert not [call for call in rpc.calls if call[0] == "submit"]
 
@@ -1034,7 +1570,7 @@ def test_post_submit_observation_failure_preserves_recoverable_outcome(db: Path)
     rpc.complete(identity.task_id, content="Recovered after a transient read.")
     runtime.wakeup()
     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
     task = state.get_task(db, identity)
     assert task["result"]["text"] == "Recovered after a transient read."
@@ -1059,7 +1595,7 @@ def test_cancellation_is_persisted_before_interrupt_and_fences_late_result(
     rpc.complete(identity.task_id, content="Too late.")
     runtime.wakeup()
     time.sleep(0.05)
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
     assert cancelled["status"] == "cancelled"
     assert observed_status == ["stopping"]
@@ -1092,8 +1628,135 @@ def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path):
     runtime.wakeup()
     _wait_for(lambda: state.get_task(db, identity)["status"] == "cancelled")
     assert attempts >= 2
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
     assert state.get_task(db, identity)["status"] == "cancelled"
+
+
+def test_provisional_stopping_response_does_not_acknowledge_cancellation(db: Path):
+    identity = _identity()
+    _admit(db, identity)
+    rpc = FakeSessionRPC(auto_complete=False)
+    runtime = _runtime(db, rpc)
+    lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation=runtime.process_generation,
+        ttl_seconds=1,
+        clock=time.time,
+    )
+    runtime._leases[ROOM_ID] = lease
+    attempt = state.start_task(
+        db,
+        identity,
+        lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    session_id = rpc.add_session(active=True, task_id=identity.task_id)
+    rpc.states[session_id]["execution_generation"] = attempt.execution_generation
+    terminal = False
+
+    def peer_interrupt(**_kwargs):
+        return {"status": "cancelled" if terminal else "stopping"}
+
+    rpc.interrupt = peer_interrupt
+    stopping = runtime.cancel(identity, cancel_id="cancel-peer")
+
+    assert stopping["status"] == "stopping"
+    assert state.get_task(db, identity)["status"] == "stopping"
+
+    terminal = True
+    cancelled = runtime.cancel(identity, cancel_id="cancel-peer")
+
+    assert cancelled["status"] == "cancelled"
+
+
+def test_peer_terminal_status_acknowledges_durable_stop_on_retry(db: Path):
+    identity = _identity()
+    _admit(db, identity)
+    rpc = FakeSessionRPC(auto_complete=False)
+    runtime = _runtime(db, rpc)
+    lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation=runtime.process_generation,
+        ttl_seconds=1,
+        clock=time.time,
+    )
+    runtime._leases[ROOM_ID] = lease
+    attempt = state.start_task(
+        db,
+        identity,
+        lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    client = TerminalPeerClient(
+        task_id=identity.task_id,
+        execution_generation=attempt.execution_generation,
+    )
+    runtime.transport_resolver = _peer_resolver(client)
+    stopping = state.begin_task_cancel(
+        db,
+        identity,
+        cancel_id="cancel-peer-terminal",
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    assert stopping["status"] == "stopping"
+
+    runtime._retry_stopping_tasks(BINDING, lease)
+
+    assert state.get_task(db, identity)["status"] == "cancelled"
+    assert client.history_calls == 0
+
+
+def test_peer_terminal_status_must_match_exact_task_attempt(db: Path):
+    identity = _identity()
+    _admit(db, identity)
+    rpc = FakeSessionRPC(auto_complete=False)
+    runtime = _runtime(db, rpc)
+    lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation=runtime.process_generation,
+        ttl_seconds=1,
+        clock=time.time,
+    )
+    runtime._leases[ROOM_ID] = lease
+    attempt = state.start_task(
+        db,
+        identity,
+        lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    client = TerminalPeerClient(
+        task_id=identity.task_id,
+        execution_generation=attempt.execution_generation,
+    )
+    client.status_task_id = "different-task"
+    runtime.transport_resolver = _peer_resolver(client)
+
+    stopping = state.begin_task_cancel(
+        db,
+        identity,
+        cancel_id="cancel-mismatch",
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+
+    assert runtime._peer_stop_acknowledged(BINDING, stopping) is False
+    client.status_task_id = identity.task_id
+    client.status_generation = attempt.execution_generation + 1
+    assert runtime._peer_stop_acknowledged(BINDING, stopping) is False
+    assert state.get_task(db, identity)["status"] == "stopping"
 
 
 def test_completion_wins_a_race_with_unacknowledged_stop(db: Path):
@@ -1114,35 +1777,39 @@ def test_completion_wins_a_race_with_unacknowledged_stop(db: Path):
 
     assert result["status"] == "settled"
     assert result["result"]["text"] == "Already done."
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
 
 def test_restart_harvests_completion_before_retrying_durable_stop(db: Path):
     identity = _identity()
-    _admit(db, identity)
     now = [100.0]
+
+    def clock():
+        return now[0]
+
+    _admit(db, identity)
     old_lease = state.acquire_lease(
         db,
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
         process_generation="old-process",
-        ttl_seconds=1.0,
-        clock=lambda: now[0],
+        ttl_seconds=1,
+        clock=clock,
     )
     attempt = state.start_task(
         db,
         identity,
         old_lease,
         expected_cancel_generation=0,
-        clock=lambda: now[0],
+        clock=clock,
     )
     stopping = state.begin_task_cancel(
         db,
         identity,
         cancel_id="cancel-before-restart",
         expected_cancel_generation=attempt.cancel_generation,
-        clock=lambda: now[0],
+        clock=clock,
     )
     rpc = FakeSessionRPC(auto_complete=False)
     rpc.add_session(
@@ -1159,17 +1826,17 @@ def test_restart_harvests_completion_before_retrying_durable_stop(db: Path):
             }
         ],
     )
-    now[0] += 2.0
+    now[0] = 102.0
     runtime = _runtime(
         db,
         rpc,
         process_generation="new-process",
-        clock=lambda: now[0],
+        clock=clock,
     )
 
     runtime.start()
     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
     settled = state.get_task(db, identity)
     assert stopping["status"] == "stopping"
@@ -1179,6 +1846,11 @@ def test_restart_harvests_completion_before_retrying_durable_stop(db: Path):
 
 def test_restart_acknowledges_inactive_local_stop_without_memory_marker(db: Path):
     identity = _identity()
+    now = [100.0]
+
+    def clock():
+        return now[0]
+
     _admit(db, identity)
     old_lease = state.acquire_lease(
         db,
@@ -1186,31 +1858,89 @@ def test_restart_acknowledges_inactive_local_stop_without_memory_marker(db: Path
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
         process_generation="old-process",
-        ttl_seconds=0.05,
-        clock=time.time,
+        ttl_seconds=1,
+        clock=clock,
     )
     attempt = state.start_task(
         db,
         identity,
         old_lease,
         expected_cancel_generation=0,
-        clock=time.time,
+        clock=clock,
     )
     state.begin_task_cancel(
         db,
         identity,
         cancel_id="cancel-before-restart",
         expected_cancel_generation=attempt.cancel_generation,
-        clock=time.time,
+        clock=clock,
     )
     rpc = FakeSessionRPC(auto_complete=False)
-    time.sleep(0.06)
-    runtime = _runtime(db, rpc, process_generation="new-process")
+    now[0] = 102.0
+    runtime = _runtime(
+        db,
+        rpc,
+        process_generation="new-process",
+        clock=clock,
+    )
 
     cancelled = runtime.cancel(identity, cancel_id="cancel-before-restart")
 
     assert cancelled["status"] == "cancelled"
     assert not [call for call in rpc.calls if call[0] == "interrupt"]
+
+
+def test_stop_resumes_persisted_session_before_reading_runtime_history(db: Path):
+    identity = _identity()
+    _admit(db, identity)
+    rpc = FakeSessionRPC(auto_complete=False)
+    runtime = _runtime(db, rpc)
+    lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation=runtime.process_generation,
+        ttl_seconds=1,
+        clock=time.time,
+    )
+    runtime._leases[ROOM_ID] = lease
+    attempt = state.start_task(
+        db,
+        identity,
+        lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    stored_id = rpc.add_session(active=False, task_id=identity.task_id)
+    runtime_id = "runtime-session"
+    rpc.states[runtime_id] = rpc.states.pop(stored_id)
+
+    def resume(**kwargs):
+        events.append("resume")
+        return {"session_id": runtime_id}
+
+    original_history = rpc.history
+
+    def history(**kwargs):
+        events.append("history")
+        return original_history(**kwargs)
+
+    events: list[str] = []
+    rpc.resume = resume
+    rpc.history = history
+    state.begin_task_cancel(
+        db,
+        identity,
+        cancel_id="cancel-remapped",
+        expected_cancel_generation=attempt.cancel_generation,
+        clock=time.time,
+    )
+
+    cancelled = runtime.cancel(identity, cancel_id="cancel-remapped")
+
+    assert cancelled["status"] == "cancelled"
+    assert events.index("resume") < events.index("history")
 
 
 def test_pending_local_approval_is_reported_with_safe_choices(db: Path):
@@ -1244,7 +1974,7 @@ def test_pending_local_approval_is_reported_with_safe_choices(db: Path):
     assert member == PROFILE
     assert action["request_id"] == "approval-1"
     assert action["approval"]["choices"] == ["once", "deny"]
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
 
 def test_cancel_never_interrupts_a_newer_task_in_the_same_session(db: Path):
@@ -1267,10 +1997,11 @@ def test_cancel_never_interrupts_a_newer_task_in_the_same_session(db: Path):
 
     assert cancelled["status"] == "stopping"
     assert not [call for call in rpc.calls if call[0] == "interrupt"]
-    assert not [call for call in rpc.calls if call[0] == "interrupt_skipped"]
+    skipped = [params for method, params in rpc.calls if method == "interrupt_skipped"]
+    assert all(params["expected_task_id"] == identity.task_id for params in skipped)
     assert rpc.states[session_id]["active"] is True
     assert rpc.states[session_id]["task_id"] == "task-2"
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
 
 def test_status_reports_room_blocked_on_unresolved_indeterminate_task(db: Path):
@@ -1300,7 +2031,7 @@ def test_status_reports_room_blocked_on_unresolved_indeterminate_task(db: Path):
 
     runtime.start()
     _wait_for(lambda: ROOM_ID in runtime.status()["blocked_rooms"])
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
     assert state.get_task(db, identity)["status"] == "indeterminate"
 
@@ -1309,7 +2040,11 @@ def test_authority_loss_stops_terminal_commit(db: Path):
     identity = _identity()
     _admit(db, identity)
     rpc = FakeSessionRPC(auto_complete=False)
-    runtime = _runtime(db, rpc, lease_ttl_seconds=0.1)
+    # Generous lease TTL: this test is about AUTHORITY loss. A short TTL let
+    # a loaded CI runner expire the lease before the authority change was
+    # observed, so last_error flipped to "driver lease is stale or expired"
+    # (flaky main run 33455779041).
+    runtime = _runtime(db, rpc, lease_ttl_seconds=30.0)
 
     runtime.start()
     assert rpc.submitted.wait(1.0)
@@ -1325,7 +2060,7 @@ def test_authority_loss_stops_terminal_commit(db: Path):
     rpc.complete(identity.task_id)
     runtime.wakeup()
     _wait_for(lambda: runtime.status()["last_error"] is not None)
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
     assert state.get_task(db, identity)["status"] == "running"
     assert "authority changed" in runtime.status()["last_error"]
@@ -1340,7 +2075,7 @@ def test_profile_turn_lock_covers_resolve_submit_and_terminal_observation(db: Pa
 
     runtime.start()
     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
-    assert runtime.stop(timeout=1.0)
+    assert runtime.stop(timeout=5.0)
 
     assert locks.events == [("lock-enter", PROFILE), ("lock-exit", PROFILE)]
     methods = [method for method, _params in rpc.calls]

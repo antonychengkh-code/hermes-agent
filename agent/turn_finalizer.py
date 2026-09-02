@@ -151,6 +151,13 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
+    # Reaching here means the turn ended through the normal path. The wrapper
+    # around run_conversation reads this to tell a finalized turn from one of
+    # the ~25 early returns inside the loop, which skip this function entirely
+    # and would otherwise let a kanban worker abandon its card in silence.
+    # Set first, before any of the work below can raise.
+    agent._turn_finalized = True
+
     budget_exhausted = (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
@@ -752,7 +759,7 @@ def finalize_turn(
             "health (`hermes doctor`), then send your message again"
         )
         # Machine-readable cause for the gateway/desktop: exactly
-        # 'session_persistence_failed:<locked|compression|turn_lease|corrupt|disk|unknown>'.
+        # 'session_persistence_failed:<locked|compression|turn_lease|corrupt|replaced|disk|unknown>'.
         # Never clobber a failure_reason another path already stamped.
         if "failure_reason" not in result:
             _cause = getattr(agent, "_last_persistence_error_cause", None)
