@@ -21,6 +21,11 @@ Buttons bubble — the user taps it later to receive the cached answer via a
 with ERROR for cancelled runs. Set the threshold to 0 to disable the
 button and always Push-fallback instead.
 
+The button is best-effort, never a gate: an outstanding button claims at
+most the one answer it was raised for, and any answer the cache declines
+is delivered directly. A user who ignores a button must still get every
+later reply.
+
 **Three-allowlist gating.** Separate allowlists for users (U-prefixed),
 groups (C-prefixed), and rooms (R-prefixed). ``LINE_ALLOW_ALL_USERS=true``
 is a dev-only escape hatch.
@@ -374,21 +379,32 @@ class RequestCache:
     def get(self, request_id: str) -> Optional[_CacheEntry]:
         return self._entries.get(request_id)
 
-    def set_ready(self, request_id: str, payload: Any) -> None:
+    def set_ready(self, request_id: str, payload: Any) -> bool:
+        """Park a payload against a PENDING request.
+
+        Returns True when the payload was stored. False means the caller
+        still owns delivery: the entry was pruned, or it is no longer
+        PENDING (a previous answer is sitting unread in READY, or was
+        already DELIVERED). Callers must not treat False as "sent" —
+        silently dropping it strands the response and the chat goes mute.
+        """
         entry = self._entries.get(request_id)
         if entry is None or entry.state is not State.PENDING:
-            return
+            return False
         entry.state = State.READY
         entry.payload = payload
         entry.updated_at = time.time()
+        return True
 
-    def set_error(self, request_id: str, message: str) -> None:
+    def set_error(self, request_id: str, message: str) -> bool:
+        """Mark a PENDING request as failed. See set_ready for the return."""
         entry = self._entries.get(request_id)
         if entry is None or entry.state is not State.PENDING:
-            return
+            return False
         entry.state = State.ERROR
         entry.payload = message
         entry.updated_at = time.time()
+        return True
 
     def mark_delivered(self, request_id: str) -> None:
         entry = self._entries.get(request_id)
@@ -1191,9 +1207,18 @@ class LineAdapter(BasePlatformAdapter):
 
         # If the chat has a PENDING postback button outstanding, route the
         # response into the cache for the user to fetch via tap.
-        pending_rid = self._pending_buttons.get(chat_id)
-        if pending_rid:
-            self._cache.set_ready(pending_rid, content)
+        #
+        # Pop rather than peek: the button carries its own request_id, so
+        # _handle_postback_event still resolves the tap from the postback
+        # payload. Leaving the entry in place instead pinned the chat to a
+        # rid the user may never tap, and every later answer was diverted
+        # into the cache — the chat went permanently mute.
+        #
+        # A False return means the cache did not take the payload (entry
+        # pruned, or an earlier answer still unread). Fall through and
+        # deliver it directly instead of reporting a send that never left.
+        pending_rid = self._pending_buttons.pop(chat_id, None)
+        if pending_rid and self._cache.set_ready(pending_rid, content):
             return SendResult(success=True, message_id=pending_rid)
 
         return await self._send_text_chunks(chat_id, content, force_push=False)
