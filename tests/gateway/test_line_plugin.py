@@ -142,6 +142,20 @@ class TestRequestCache:
         assert c.get(rid).state is State.DELIVERED
 
 
+    def test_transitions_report_whether_they_took_the_payload(self):
+        c = RequestCache()
+        rid = c.register_pending("Uchat")
+        assert c.set_ready(rid, "first") is True
+        # Already READY — refused, so the caller still owns delivery.
+        assert c.set_ready(rid, "second") is False
+        assert c.mark_delivered(rid) is True
+        assert c.set_ready(rid, "third") is False
+        assert c.set_error(rid, "boom") is False
+        # An unknown rid must never read as stored.
+        assert c.set_ready("no-such-rid", "x") is False
+        assert c.set_error("no-such-rid", "x") is False
+
+
 # ---------------------------------------------------------------------------
 # 6. Markdown stripping + chunking
 # ---------------------------------------------------------------------------
@@ -246,6 +260,75 @@ class TestSendRouting:
         assert _is_system_bypass("⏩ Steered toward new task")
         assert not _is_system_bypass("Hello world")
         assert not _is_system_bypass("")
+
+
+    def test_untapped_button_does_not_mute_later_answers(self, adapter):
+        """Regression: an ignored postback button silenced the chat for good.
+
+        send() peeked at _pending_buttons instead of popping it, so once a
+        button was raised and never tapped, every later answer was parked in
+        the cache and nothing reached LINE again.
+        """
+        rid = adapter._cache.register_pending("Uchat")
+        adapter._pending_buttons["Uchat"] = rid
+
+        first = asyncio.run(adapter.send("Uchat", "answer one"))
+        assert first.success and first.message_id == rid
+        assert adapter._cache.get(rid).payload == "answer one"
+        adapter._client.push.assert_not_awaited()
+
+        # The user never taps. The next answer must still be delivered.
+        second = asyncio.run(adapter.send("Uchat", "answer two"))
+        assert second.success
+        adapter._client.push.assert_awaited_once()
+        assert adapter._client.push.await_args.args[1][0]["text"] == "answer two"
+        assert "Uchat" not in adapter._pending_buttons
+
+    def test_refused_cache_write_falls_back_to_delivery(self, adapter):
+        """A rid the cache will not take must not swallow the answer."""
+        adapter._pending_buttons["Uchat"] = "rid-the-cache-does-not-know"
+
+        result = asyncio.run(adapter.send("Uchat", "answer"))
+
+        assert result.success
+        adapter._client.push.assert_awaited_once()
+        assert adapter._client.push.await_args.args[1][0]["text"] == "answer"
+
+    def test_system_bypass_leaves_the_button_outstanding(self, adapter):
+        """A busy-ack routes straight to LINE without consuming the button."""
+        rid = adapter._cache.register_pending("Uchat")
+        adapter._pending_buttons["Uchat"] = rid
+
+        result = asyncio.run(adapter.send("Uchat", "⏳ Queued — agent is busy"))
+
+        assert result.success
+        adapter._client.push.assert_awaited_once()
+        # The real answer is still to come — the button must survive.
+        assert adapter._pending_buttons["Uchat"] == rid
+        assert adapter._cache.get(rid).state is State.PENDING
+
+    def test_tap_still_resolves_from_postback_payload(self, adapter):
+        """Popping _pending_buttons must not break the tap path.
+
+        _handle_postback_event resolves the request from the postback data's
+        request_id, not from that dict, so a tap after send() still delivers.
+        """
+        rid = adapter._cache.register_pending("Uchat")
+        adapter._pending_buttons["Uchat"] = rid
+        asyncio.run(adapter.send("Uchat", "cached answer"))
+
+        asyncio.run(adapter._handle_postback_event({
+            "type": "postback",
+            "replyToken": "fresh-token",
+            "source": {"type": "user", "userId": "Uchat"},
+            "postback": {"data": json.dumps(
+                {"action": "show_response", "request_id": rid}
+            )},
+        }))
+
+        adapter._client.reply.assert_awaited_once()
+        assert adapter._client.reply.await_args.args[1][0]["text"] == "cached answer"
+        assert adapter._cache.get(rid).state is State.DELIVERED
 
 
     def test_send_caps_messages_per_call_at_five(self, adapter):

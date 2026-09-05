@@ -169,20 +169,24 @@ class RequestCache:
     def get(self, request_id: str) -> Optional[_CacheEntry]:
         return self._entries.get(request_id)
 
-    def _transition(self, request_id: str, allowed: Set[State], state: State, payload: Any = None) -> None:
+    def _transition(self, request_id: str, allowed: Set[State], state: State, payload: Any = None) -> bool:
+        """Move an entry between states. False = refused, caller still owns the payload."""
         entry = self._entries.get(request_id)
-        if entry is not None and entry.state in allowed:
-            entry.state = state
-            entry.payload = entry.payload if state is State.DELIVERED else payload
+        if entry is None or entry.state not in allowed:
+            return False
+        entry.state = state
+        entry.payload = entry.payload if state is State.DELIVERED else payload
+        return True
 
-    def set_ready(self, request_id: str, payload: Any) -> None:
-        self._transition(request_id, {State.PENDING}, State.READY, payload)
+    def set_ready(self, request_id: str, payload: Any) -> bool:
+        """Park a payload against a PENDING request. False = not stored, deliver it yourself."""
+        return self._transition(request_id, {State.PENDING}, State.READY, payload)
 
-    def set_error(self, request_id: str, message: str) -> None:
-        self._transition(request_id, {State.PENDING}, State.ERROR, message)
+    def set_error(self, request_id: str, message: str) -> bool:
+        return self._transition(request_id, {State.PENDING}, State.ERROR, message)
 
-    def mark_delivered(self, request_id: str) -> None:
-        self._transition(request_id, {State.READY, State.ERROR}, State.DELIVERED)
+    def mark_delivered(self, request_id: str) -> bool:
+        return self._transition(request_id, {State.READY, State.ERROR}, State.DELIVERED)
 
 
 class _MessageDeduplicator:
@@ -630,10 +634,18 @@ class LineAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="LINE adapter not connected")
         # A PENDING postback button caches the response for the tap — except system
         # busy-acks, which must land as visible bubbles.
-        pending_rid = self._pending_buttons.get(chat_id)
-        if pending_rid and not _is_system_bypass(content):
-            self._cache.set_ready(pending_rid, content)
-            return SendResult(success=True, message_id=pending_rid)
+        #
+        # Pop, don't peek: the button carries its own request_id, so a tap still
+        # resolves via the postback payload. Leaving the entry pinned the chat to
+        # a button the user may never tap, and every later answer was diverted
+        # into the cache — the chat went silent for good. A button claims at most
+        # the one answer it was raised for, and a refused cache write (an earlier
+        # answer still unread) falls through to normal delivery rather than
+        # reporting a send that never left.
+        if not _is_system_bypass(content):
+            pending_rid = self._pending_buttons.pop(chat_id, None)
+            if pending_rid and self._cache.set_ready(pending_rid, content):
+                return SendResult(success=True, message_id=pending_rid)
         # System busy-acks (interrupting / queued / steered) bypass the postback cache and route directly to
         # LINE so they reach the user as visible bubbles. Source: PR #18153.
         return await self._send_text_chunks(chat_id, content, force_push=False)
